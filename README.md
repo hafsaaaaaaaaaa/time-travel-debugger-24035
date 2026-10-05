@@ -51,7 +51,3 @@ include/   headers for each pass and shared types
 src/       implementation
 sample/    test programs
 ```
-
-## Status
-
-Phase 01 deadline: 5 October 2026.
