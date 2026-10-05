@@ -1,0 +1,6 @@
+build/
+ttdb
+resolve.bin
+*.tdbg
+.DS_Store
+.vscode/
