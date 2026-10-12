@@ -1,5 +1,6 @@
 build/
 ttdb
+ttdb.dSYM/
 resolve.bin
 *.tdbg
 .DS_Store
