@@ -8,7 +8,7 @@ bool validate(const string &path, string &error)
     ifstream in(path);
     if (!in)
     {
-        error = "cannot open " +path;
+        error = "cannot open " + path;
         return false;
     }
 
@@ -21,12 +21,33 @@ bool validate(const string &path, string &error)
         lineNo++;
         istringstream iss(line);
         string keyword;
-        if (!(iss >> keyword)){
+        if (!(iss >> keyword))
+        {
             continue;
         }
 
         if (keyword == "func")
         {
+            string name;
+            if (!(iss >> name))
+            {
+                error = "line " + to_string(lineNo) + ": func needs a name";
+                return false;
+            }
+
+            int count = 0;
+            string param;
+            while (iss >> param)
+            {
+                count++;
+            }
+
+            if (count > 16)
+            {
+                error = "line " + to_string(lineNo) + ": too many parameters";
+                return false;
+            }
+
             if (!open.empty())
             {
                 error = "line " + to_string(lineNo) + ": nested function, function at line " + to_string(open.top()) + " is not closed";
@@ -34,7 +55,7 @@ bool validate(const string &path, string &error)
             }
             open.push(lineNo);
         }
-        else if (keyword =="func_end")
+        else if (keyword == "func_end")
         {
             if (open.empty())
             {
@@ -50,5 +71,6 @@ bool validate(const string &path, string &error)
         error = "line " + to_string(open.top()) + ": function without a matching func_end";
         return false;
     }
+
     return true;
 }
