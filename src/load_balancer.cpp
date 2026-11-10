@@ -33,6 +33,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <sys/time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -280,6 +281,21 @@ int connectToServerWithWakeup()
 // =============================================================================================
 
 
+void refuseAndClose(int sock, const string &message)
+{
+    sendError(sock, message);
+    shutdown(sock, SHUT_WR);
+    timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char junk[4096];
+    while (recv(sock, junk, sizeof(junk), 0) > 0)
+    {
+    }
+    close(sock);
+}
+
 void relayOneClient(ClientInfo &c)
 {
     // 1. serverSock = connectToServerWithWakeup().
@@ -293,8 +309,7 @@ void relayOneClient(ClientInfo &c)
     int serverSock = connectToServerWithWakeup();
     if (serverSock < 0)
     {
-        sendError(c.sock, "backend server failed to start");
-        close(c.sock);
+        refuseAndClose(c.sock, "backend server failed to start");
         return;
     }
     vector<char> buf(IO_BUFFER_SIZE);
@@ -397,8 +412,7 @@ void acceptLoop(int listenSock)
         }
         if (full)
         {
-            sendError(sock, "server busy, try again later");
-            close(sock);
+            thread(refuseAndClose, sock, string("server busy, try again later")).detach();
         }
     }
 }
