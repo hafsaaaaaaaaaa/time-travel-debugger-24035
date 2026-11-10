@@ -51,3 +51,41 @@ include/   headers for each pass and shared types
 src/       implementation
 sample/    test programs
 ```
+
+## Phase 02: client, load balancer and server
+
+Build everything:
+
+    make
+
+Run, from the repo root (two terminals):
+
+    ./load_balancer 127.0.0.1 5001
+    ./client 127.0.0.1 5000
+
+The load balancer listens on port 5000 and starts `./server 5001` by itself when the server is down. The client only talks to the load balancer.
+
+Client commands:
+
+    start <source file>   run the program and show step 1
+    next                  go one step forward
+    prv                   go one step back
+    jmp next <n>          go n steps forward
+    jmp prv <n>           go n steps back
+    help                  show the commands
+    quit, exit            leave the debugger
+
+Only `start` uses the network. After the `.tdbg` file is saved, `next`, `prv` and `jmp` read it from disk through the index.
+
+Message format on every hop: `[status: 1 byte][body][checksum: 4 bytes]`. Status 0 means the body is the `.tdbg` file (or the source, on upload), status 1 means the body is an error message. The checksum is CRC-32 over the status byte and the body, sent big-endian.
+
+Error cases:
+
+| Case | What happens |
+| --- | --- |
+| Queue full (more than 8 waiting) | Load balancer replies "server busy, try again later" |
+| Server cannot start or connect | Load balancer replies "backend server failed to start" |
+| Client waited too long in the queue | Load balancer closes the socket with no reply, client prints "connection closed without a reply" |
+| Upload checksum mismatch | Error sent to the client: "upload checksum mismatch" |
+| Reply checksum mismatch | Client deletes the file and prints "checksum mismatch, response corrupted" |
+| Bad .tdbg file | Client prints "server sent a damaged .tdbg file" and keeps the old session |
