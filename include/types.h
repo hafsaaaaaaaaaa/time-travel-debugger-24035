@@ -1,22 +1,11 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include "helper.h"
 using namespace std;
 
 const int MAX_VARS_PER_FRAME = 16;
 const int MAX_STACK_DEPTH = 32;
-
-struct FuncEntry
-{
-    string funcName;
-    int64_t byteOffsetInResolveBin;
-};
-
-struct PendingPatch
-{
-    int64_t byteOffsetOfOffsetField;
-    string targetFuncName;
-};
 
 enum TokenType
 {

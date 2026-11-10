@@ -14,11 +14,14 @@
 
 #include <iostream>
 #include <string>
+#include <sstream>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <vector>
 #include <sys/socket.h>
@@ -39,7 +42,7 @@ int LB_PORT = 5000;
 // These two must be the same as in Phase 1
 
 const int MAX_VARS_PER_FRAME = 16;
-const int MAX_STACK_DEPTH = 64;
+const int MAX_STACK_DEPTH = 32;
 
 
 // ---- Structs (same as Phase 1, so the file can be read back exactly as it was written) ----
@@ -243,15 +246,181 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
 // The index lets us jump straight to any step without reading the steps before it.
 // =============================================================================================
 
+bool readAt(int fd, void *buf, size_t n, int64_t offset)
+{
+    char *p = (char *)buf;
+    size_t done = 0;
+    while (done < n)
+    {
+        ssize_t r = pread(fd, p + done, n - done, offset + done);
+        if (r <= 0)
+        {
+            return false;
+        }
+        done += r;
+    }
+    return true;
+}
+bool takeBytes(const vector<char> &data, size_t &pos, void *out, size_t n)
+{
+    if (n > data.size() - pos)
+    {
+        return false;
+    }
+    memcpy(out, data.data() + pos, n);
+    pos += n;
+    return true;
+}
+bool takeInt32(const vector<char> &data, size_t &pos, int32_t &value)
+{
+    return takeBytes(data, pos, &value, sizeof(value));
+}
+bool takeString(const vector<char> &data, size_t &pos, string &value)
+{
+    uint32_t size;
+    if (!takeBytes(data, pos, &size, sizeof(size)))
+    {
+        return false;
+    }
+    if (size > data.size() - pos)
+    {
+        return false;
+    }
+    value.assign(data.data() + pos, size);
+    pos += size;
+    return true;
+}
+bool takeVariable(const vector<char> &data, size_t &pos, Variable &v)
+{
+    return takeString(data, pos, v.name) && takeInt32(data, pos, v.value);
+}
+bool parseSnapshot(const vector<char> &data, Snapshot &s)
+{
+    size_t pos = 0;
+    int32_t depth;
+    if (!takeInt32(data, pos, depth) || depth < 0 || depth > MAX_STACK_DEPTH)
+    {
+        return false;
+    }
+    s.stackDepth = depth;
+    for (int i = 0; i < depth; i++)
+    {
+        Frame &f = s.callStack[i];
+        if (!takeString(data, pos, f.func_name) || !takeInt32(data, pos, f.argc))
+        {
+            return false;
+        }
+        if (f.argc < 0 || f.argc > MAX_VARS_PER_FRAME)
+        {
+            return false;
+        }
+        for (int j = 0; j < f.argc; j++)
+        {
+            if (!takeVariable(data, pos, f.argv[j]))
+            {
+                return false;
+            }
+        }
+        if (!takeInt32(data, pos, f.returnLine) || !takeInt32(data, pos, f.localCount))
+        {
+            return false;
+        }
+        if (f.localCount < 0 || f.localCount > MAX_VARS_PER_FRAME)
+        {
+            return false;
+        }
+        for (int j = 0; j < f.localCount; j++)
+        {
+            if (!takeVariable(data, pos, f.locals[j]))
+            {
+                return false;
+            }
+        }
+    }
+    return pos == data.size();
+}
+
 bool openTdbg(const char *path, TdbgReader &r)
 {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        return false;
+    }
+    struct stat st;
+    char hdr[20];
+    if (fstat(fd, &st) < 0 || !readAt(fd, hdr, sizeof(hdr), 0))
+    {
+        close(fd);
+        return false;
+    }
+    TTDBHeader h;
+    memcpy(h.magic, hdr, 4);
+    memcpy(&h.version, hdr + 4, 4);
+    memcpy(&h.stepCount, hdr + 8, 4);
+    memcpy(&h.indexOffset, hdr + 12, 8);
+    if (memcmp(h.magic, "TTDB", 4) != 0 || h.version != 1 || h.stepCount <= 0 || h.indexOffset < 20 ||
+        h.indexOffset + (int64_t)h.stepCount * 8 != (int64_t)st.st_size)
+    {
+        close(fd);
+        return false;
+    }
+    vector<int64_t> index(h.stepCount);
+    if (!readAt(fd, index.data(), index.size() * sizeof(int64_t), h.indexOffset))
+    {
+        close(fd);
+        return false;
+    }
+    int64_t prev = 20;
+    for (int i = 0; i < h.stepCount; i++)
+    {
+        if (index[i] < prev || index[i] >= h.indexOffset)
+        {
+            close(fd);
+            return false;
+        }
+        prev = index[i] + 1;
+    }
+    r.file_index = fd;
+    r.header = h;
+    r.index = index;
+    return true;
 }
 void closeTdbg(TdbgReader &r)
 {
     // Free r.index and close the file.
+    vector<int64_t>().swap(r.index);
+    if (r.file_index >= 0)
+    {
+        close(r.file_index);
+    }
+    r.file_index = -1;
 }
 Snapshot *readSnapshotAt(TdbgReader &r, int32_t step)
 {
+    if (step < 0 || step >= r.header.stepCount)
+    {
+        return nullptr;
+    }
+    int64_t start = r.index[step];
+    int64_t end = r.header.indexOffset;
+    if (step + 1 < r.header.stepCount)
+    {
+        end = r.index[step + 1];
+    }
+    vector<char> data(end - start);
+    if (!readAt(r.file_index, data.data(), data.size(), start))
+    {
+        return nullptr;
+    }
+    Snapshot *s = new Snapshot;
+    s->stackDepth = 0;
+    if (!parseSnapshot(data, *s))
+    {
+        delete s;
+        return nullptr;
+    }
+    return s;
 }
 
 // =============================================================================================
@@ -262,11 +431,20 @@ Snapshot *readSnapshotAt(TdbgReader &r, int32_t step)
 void initSession(DebugSession &s)
 {
    
+    s.active_flag = 0;
+    s.reader.file_index = -1;
+    s.reader.index.clear();
+    s.currentStep = 0;
 }
 void closeSession(DebugSession &s)
 {
     // If active, call closeTdbg(s.reader). Then set active = false.
     // Called when the user types quit and when the input ends.
+    if (s.active_flag)
+    {
+        closeTdbg(s.reader);
+    }
+    s.active_flag = 0;
 }
 
 // =============================================================================================
@@ -279,9 +457,37 @@ bool showCurrent(DebugSession &s)
 {
     // Read the snapshot at s.currentStep, call printSnapshot, delete the snapshot.
     // If readSnapshotAt returns nullptr, print "damaged .tdbg file" and return false.
+    Snapshot *snap = readSnapshotAt(s.reader, (int32_t)s.currentStep);
+    if (snap == nullptr)
+    {
+        cout << "damaged .tdbg file" << endl;
+        return false;
+    }
+    printSnapshot((int32_t)s.currentStep + 1, s.reader.header.stepCount, *snap);
+    delete snap;
+    return true;
 }
 bool moveBy(DebugSession &s, int32_t delta)
 {
+    if (!s.active_flag)
+    {
+        cout << "no session yet, use: start <source file>" << endl;
+        return false;
+    }
+    int64_t target = s.currentStep + (int64_t)delta;
+    if (target < 0 || target >= s.reader.header.stepCount)
+    {
+        cout << "step out of range, valid steps are 1 to " << s.reader.header.stepCount << endl;
+        return false;
+    }
+    int64_t previous = s.currentStep;
+    s.currentStep = target;
+    if (!showCurrent(s))
+    {
+        s.currentStep = previous;
+        return false;
+    }
+    return true;
 }
 bool cmdStart(DebugSession &s, const string &sourcePath)
 {
@@ -292,11 +498,61 @@ bool cmdStart(DebugSession &s, const string &sourcePath)
     // 4. Only now close the old reader (if s.active), then put the new reader into s,
     //    set s.currentStep = 0 and s.active = true.
     // 5. Show step 1 with showCurrent(s).
+    string tmpPath = string(TDBG_FILE) + ".tmp";
+    int sock = connectToHost(LB_HOST.c_str(), LB_PORT);
+    if (sock < 0)
+    {
+        cout << "cannot connect to the load balancer" << endl;
+        return false;
+    }
+    if (!uploadSource(sock, sourcePath.c_str()))
+    {
+        close(sock);
+        cout << "could not send the source file" << endl;
+        return false;
+    }
+    string error;
+    bool received = receiveResponse(sock, tmpPath.c_str(), error);
+    close(sock);
+    if (!received)
+    {
+        remove(tmpPath.c_str());
+        cout << error << endl;
+        return false;
+    }
+    TdbgReader fresh;
+    if (!openTdbg(tmpPath.c_str(), fresh))
+    {
+        remove(tmpPath.c_str());
+        cout << "server sent a damaged .tdbg file" << endl;
+        return false;
+    }
+    if (s.active_flag)
+    {
+        closeTdbg(s.reader);
+    }
+    s.reader = fresh;
+    rename(tmpPath.c_str(), TDBG_FILE);
+    s.currentStep = 0;
+    s.active_flag = 1;
+    return showCurrent(s);
 }
-bool cmdNext(DebugSession &s) {}
-bool cmdPrv(DebugSession &s) {}
-bool cmdJmpNext(DebugSession &s, int32_t n) {}
-bool cmdJmpPrv(DebugSession &s, int32_t n) { }
+bool cmdNext(DebugSession &s)
+{
+return moveBy(s, 1);
+}
+bool cmdPrv(DebugSession &s)
+{
+return moveBy(s, -1);
+}
+bool cmdJmpNext(DebugSession &s, int32_t n)
+{
+return moveBy(s, n);
+}
+bool cmdJmpPrv(DebugSession &s, int32_t n)
+{
+return moveBy(s, -n);
+}
 
 // =============================================================================================
 // PART E: PRINTING
@@ -304,10 +560,52 @@ bool cmdJmpPrv(DebugSession &s, int32_t n) { }
 
 void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot &s)
 {
+    cout << "step " << step << " of " << totalSteps << endl;
+    if (s.stackDepth == 0)
+    {
+        cout << "  (no active frames)" << endl;
+        return;
+    }
+    for (int i = s.stackDepth - 1; i >= 0; i--)
+    {
+        const Frame &f = s.callStack[i];
+        cout << "  " << f.func_name << "(";
+        for (int j = 0; j < f.argc; j++)
+        {
+            if (j > 0)
+            {
+                cout << ", ";
+            }
+            cout << f.argv[j].name << "=" << f.argv[j].value;
+        }
+        cout << ")";
+        if (i > 0)
+        {
+            cout << "  returns to line " << f.returnLine;
+        }
+        cout << endl;
+        if (f.localCount > 0)
+        {
+            cout << "    locals:";
+            for (int j = 0; j < f.localCount; j++)
+            {
+                cout << " " << f.locals[j].name << "=" << f.locals[j].value;
+            }
+            cout << endl;
+        }
+    }
 }
 void printHelp()
 {
     // Print the commands
+    cout << "commands:" << endl;
+    cout << "  start <source file>   run the program and show step 1" << endl;
+    cout << "  next                  go one step forward" << endl;
+    cout << "  prv                   go one step back" << endl;
+    cout << "  jmp next <n>          go n steps forward" << endl;
+    cout << "  jmp prv <n>           go n steps back" << endl;
+    cout << "  help                  show this list" << endl;
+    cout << "  quit, exit            leave the debugger" << endl;
 }
 
 // =============================================================================================
@@ -327,6 +625,72 @@ bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
     //      help       -> printHelp
     //      quit, exit -> set quitRequested = true
     // 4. For anything else, or a wrong number of words, print "unknown command" and the help text, and return false.
+    istringstream in(line);
+    vector<string> words;
+    string w;
+    while (in >> w)
+    {
+        words.push_back(w);
+    }
+    if (words.empty())
+    {
+        return true;
+    }
+    if (words[0] == "ttdb")
+    {
+        words.erase(words.begin());
+    }
+    if (!words.empty())
+    {
+        if (words[0] == "start" && words.size() == 2)
+        {
+            return cmdStart(s, words[1]);
+        }
+        if (words[0] == "next" && words.size() == 1)
+        {
+            return cmdNext(s);
+        }
+        if (words[0] == "prv" && words.size() == 1)
+        {
+            return cmdPrv(s);
+        }
+        if (words[0] == "jmp" && words.size() == 3 && (words[1] == "next" || words[1] == "prv"))
+        {
+            bool digits = words[2].size() <= 10;
+            for (char c : words[2])
+            {
+                if (c < '0' || c > '9')
+                {
+                    digits = false;
+                }
+            }
+            if (digits)
+            {
+                long long n = stoll(words[2]);
+                if (n >= 1 && n <= MAX_JUMP)
+                {
+                    if (words[1] == "next")
+                    {
+                        return cmdJmpNext(s, (int32_t)n);
+                    }
+                    return cmdJmpPrv(s, (int32_t)n);
+                }
+            }
+        }
+        if (words[0] == "help" && words.size() == 1)
+        {
+            printHelp();
+            return true;
+        }
+        if ((words[0] == "quit" || words[0] == "exit") && words.size() == 1)
+        {
+            quitRequested = true;
+            return true;
+        }
+    }
+    cout << "unknown command" << endl;
+    printHelp();
+    return false;
 }
 int main(int argc, char *argv[])
 {
@@ -341,4 +705,30 @@ int main(int argc, char *argv[])
     // After the loop: closeSession(session) and return 0.
     // Never exit the loop because of an error. Only quit or the end of the input leaves it.
 
+    if (argc >= 3)
+    {
+        LB_HOST = argv[1];
+        LB_PORT = atoi(argv[2]);
+    }
+    DebugSession session;
+    initSession(session);
+    cout << "ttdb time-travel debugger" << endl;
+    printHelp();
+    bool quitRequested = false;
+    string line;
+    while (true)
+    {
+        if (quitRequested)
+        {
+            break;
+        }
+        cout << PROMPT << flush;
+        if (!getline(cin, line))
+        {
+            break;
+        }
+        runCommand(session, line, quitRequested);
+    }
+    closeSession(session);
+    return 0;
 }

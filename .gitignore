@@ -4,3 +4,11 @@ resolve.bin
 *.tdbg
 .DS_Store
 .vscode/
+load_balancer
+server
+upload.bin
+resolve.bin
+session.tdbg
+client
+ttdb_last.tdbg
+ttdb_last.tdbg.tmp
